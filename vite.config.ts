@@ -16,7 +16,7 @@ export default defineConfig(({ mode }) => ({
   },
   preview: {
     // nginx 역프록시 Host 허용 (미설정 시 403 Forbidden host)
-    allowedHosts: ['crumblycake.kro.kr'],
+    allowedHosts: ['crumblycake.kro.kr', 'likelion14.kro.kr'],
     proxy: {
       '/api/rhwp': 'http://localhost:8787',
     },
