@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.DS_Store
+.npm-cache/
+keys.env
+ssh_pw.env
