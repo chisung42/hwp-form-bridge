@@ -2,11 +2,13 @@ import cors from 'cors';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import multer from 'multer';
 import JSZip from 'jszip';
 import sharp from 'sharp';
 import { HwpDocument, initSync, version } from '@rhwp/core';
+import { createClient } from '@supabase/supabase-js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
@@ -20,6 +22,13 @@ const upload = multer({
 });
 
 let rhwpReady = false;
+const formStore = new Map();
+const responseStore = new Map();
+let supabaseClient = null;
+
+function makePublicId() {
+  return crypto.randomBytes(5).toString('hex');
+}
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return {};
@@ -40,13 +49,311 @@ function loadEnvFile(filePath) {
   return env;
 }
 
+function getRuntimeEnv() {
+  return { ...loadEnvFile(keysPath), ...process.env };
+}
+
 function getGatewayConfig() {
-  const env = { ...loadEnvFile(keysPath), ...process.env };
+  const env = getRuntimeEnv();
   return {
     apiKey: env.SCHOOL_API_KEY || env.FACTCHAT_API_KEY || env.OPENAI_API_KEY,
     baseUrl: env.SCHOOL_LLM_BASE_URL || env.FACTCHAT_BASE_URL || 'https://factchat-cloud.mindlogic.ai/v1/gateway',
     model: env.SCHOOL_LLM_MODEL || env.FACTCHAT_MODEL || 'gpt-5.3-chat-latest',
   };
+}
+
+function getSupabaseConfig() {
+  const env = getRuntimeEnv();
+  return {
+    url: env.SUPABASE_URL,
+    serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_SERVICE_KEY,
+    bucket: env.SUPABASE_STORAGE_BUCKET || 'form-documents',
+  };
+}
+
+function getSupabase() {
+  const { url, serviceRoleKey } = getSupabaseConfig();
+  if (!url || !serviceRoleKey) return null;
+  if (!supabaseClient) {
+    supabaseClient = createClient(url, serviceRoleKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+      },
+    });
+  }
+  return supabaseClient;
+}
+
+function toPublicFormRecord(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    sourceName: row.source_name ?? row.sourceName,
+    fields: row.fields ?? [],
+    pageCount: row.page_count ?? row.pageCount ?? 0,
+    createdAt: row.created_at ?? row.createdAt,
+    hasSourceFile: Boolean(row.source_file_path || row.sourceFilePath || row.sourceFile),
+  };
+}
+
+function toInternalFormRecord(row, sourceFile = null) {
+  return {
+    id: row.id,
+    title: row.title,
+    fields: row.fields ?? [],
+    sourceName: row.source_name ?? row.sourceName,
+    pageCount: row.page_count ?? row.pageCount ?? 0,
+    createdAt: row.created_at ?? row.createdAt,
+    updatedAt: row.updated_at ?? row.updatedAt,
+    sourceFile,
+    sourceFilePath: row.source_file_path,
+    sourceFileName: row.source_file_name,
+  };
+}
+
+async function uploadOriginalDocument(id, file) {
+  const supabase = getSupabase();
+  if (!supabase || !file) return null;
+
+  const { bucket } = getSupabaseConfig();
+  const extension = path.extname(file.originalname) || '.hwp';
+  const storagePath = `original-documents/${id}${extension}`;
+  const { error } = await supabase.storage.from(bucket).upload(storagePath, file.buffer, {
+    contentType: file.mimetype || 'application/octet-stream',
+    upsert: true,
+  });
+  if (error) throw new Error(`Supabase Storage 업로드 실패: ${error.message}`);
+
+  return storagePath;
+}
+
+async function downloadOriginalDocument(record) {
+  const supabase = getSupabase();
+  if (!supabase || !record?.sourceFilePath) return record?.sourceFile ?? null;
+
+  const { bucket } = getSupabaseConfig();
+  const { data, error } = await supabase.storage.from(bucket).download(record.sourceFilePath);
+  if (error) throw new Error(`Supabase Storage 다운로드 실패: ${error.message}`);
+  return {
+    originalName: record.sourceFileName || record.sourceName || 'document.hwp',
+    buffer: Buffer.from(await data.arrayBuffer()),
+  };
+}
+
+async function saveFormRecord(payload, file) {
+  const id = makePublicId();
+  const now = new Date().toISOString();
+  const sourceFilePath = file ? await uploadOriginalDocument(id, file) : null;
+  const supabase = getSupabase();
+
+  if (supabase) {
+    const row = {
+      id,
+      title: payload.title,
+      source_name: payload.sourceName,
+      fields: payload.fields,
+      page_count: payload.pageCount,
+      source_file_path: sourceFilePath,
+      source_file_name: file?.originalname ?? null,
+      created_at: now,
+      updated_at: now,
+    };
+    const { data, error } = await supabase.from('forms').insert(row).select('*').single();
+    if (error) throw new Error(`Supabase forms 저장 실패: ${error.message}`);
+    return toInternalFormRecord(data);
+  }
+
+  const record = {
+    id,
+    title: payload.title,
+    fields: payload.fields,
+    sourceName: payload.sourceName,
+    pageCount: payload.pageCount,
+    createdAt: now,
+    updatedAt: now,
+    sourceFile: file
+      ? {
+          originalName: file.originalname,
+          buffer: Buffer.from(file.buffer),
+        }
+      : null,
+  };
+  formStore.set(id, record);
+  responseStore.set(id, []);
+  return record;
+}
+
+async function getFormRecord(id) {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase.from('forms').select('*').eq('id', id).single();
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      throw new Error(`Supabase forms 조회 실패: ${error.message}`);
+    }
+    return toInternalFormRecord(data);
+  }
+
+  return formStore.get(id) ?? null;
+}
+
+async function saveResponseRecord(formId, values) {
+  const response = {
+    id: makePublicId(),
+    formId,
+    createdAt: new Date().toISOString(),
+    values,
+  };
+  const supabase = getSupabase();
+
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('form_responses')
+      .insert({
+        id: response.id,
+        form_id: formId,
+        values,
+        created_at: response.createdAt,
+      })
+      .select('*')
+      .single();
+    if (error) throw new Error(`Supabase responses 저장 실패: ${error.message}`);
+    return {
+      id: data.id,
+      createdAt: data.created_at,
+      values: data.values ?? {},
+    };
+  }
+
+  const responses = responseStore.get(formId) ?? [];
+  const stored = { id: response.id, createdAt: response.createdAt, values };
+  responses.unshift(stored);
+  responseStore.set(formId, responses);
+  return stored;
+}
+
+async function listResponseRecords(formId) {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('form_responses')
+      .select('id, created_at, values')
+      .eq('form_id', formId)
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(`Supabase responses 조회 실패: ${error.message}`);
+    return (data ?? []).map((row) => ({
+      id: row.id,
+      createdAt: row.created_at,
+      values: row.values ?? {},
+    }));
+  }
+
+  return responseStore.get(formId) ?? [];
+}
+
+async function getResponseRecord(formId, responseId) {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('form_responses')
+      .select('id, created_at, values')
+      .eq('form_id', formId)
+      .eq('id', responseId)
+      .single();
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      throw new Error(`Supabase response 조회 실패: ${error.message}`);
+    }
+    return {
+      id: data.id,
+      createdAt: data.created_at,
+      values: data.values ?? {},
+    };
+  }
+
+  return (responseStore.get(formId) ?? []).find((item) => item.id === responseId) ?? null;
+}
+
+function collectCreditSummary(value, prefix = '') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const items = [];
+  const creditPattern = /(credit|balance|remain|remaining|quota|limit|usage|used|token|point|amount|잔여|크레딧|사용|한도)/i;
+
+  for (const [key, item] of Object.entries(value)) {
+    const pathKey = prefix ? `${prefix}.${key}` : key;
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      items.push(...collectCreditSummary(item, pathKey));
+      continue;
+    }
+
+    if (!creditPattern.test(pathKey)) continue;
+    if (!['string', 'number', 'boolean'].includes(typeof item)) continue;
+    items.push({
+      key: pathKey,
+      label: key,
+      value: item,
+    });
+  }
+
+  return items.slice(0, 8);
+}
+
+async function fetchGatewayCredits() {
+  const { apiKey, baseUrl, model } = getGatewayConfig();
+  if (!apiKey) {
+    return {
+      ok: false,
+      configured: false,
+      model,
+      error: 'SCHOOL_API_KEY가 없습니다.',
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  const url = `${baseUrl.replace(/\/$/, '')}/credits/`;
+
+  async function requestCredits(authorization) {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: authorization,
+      },
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    return { response, raw };
+  }
+
+  try {
+    let { response, raw } = await requestCredits(`Bearer ${apiKey}`);
+    if (response.status === 401 && /Bearer token is not supplied/i.test(raw)) {
+      ({ response, raw } = await requestCredits(apiKey));
+    }
+    const parsed = parseJson(raw, null);
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        configured: true,
+        model,
+        status: response.status,
+        error: raw.slice(0, 300) || `credits endpoint error ${response.status}`,
+      };
+    }
+
+    return {
+      ok: true,
+      configured: true,
+      model,
+      checkedAt: new Date().toISOString(),
+      summary: parsed ? collectCreditSummary(parsed) : [],
+      message: parsed ? '' : raw.slice(0, 300),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function ensureRhwp() {
@@ -1310,6 +1617,126 @@ app.get('/api/rhwp/health', (_req, res) => {
     rhwpVersion: version(),
     maxUploadMb: 25,
   });
+});
+
+app.get('/api/llm/credits', async (_req, res) => {
+  try {
+    const result = await fetchGatewayCredits();
+    res.status(result.ok ? 200 : result.configured === false ? 401 : 502).json(result);
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      configured: true,
+      model: getGatewayConfig().model,
+      error: String(error?.message ?? error),
+    });
+  }
+});
+
+app.post('/api/forms', upload.single('file'), async (req, res) => {
+  try {
+    const payload = parseJson(req.body.form ?? '{}', {});
+    const title = String(payload.title ?? '').trim();
+    const fields = Array.isArray(payload.fields) ? payload.fields : [];
+
+    if (!title || fields.length === 0) {
+      res.status(400).json({ ok: false, error: 'title과 fields가 포함된 form JSON이 필요합니다.' });
+      return;
+    }
+
+    const record = await saveFormRecord(
+      {
+      title,
+      fields,
+      sourceName: String(payload.sourceName ?? title),
+      pageCount: Number(payload.pageCount ?? 0),
+      },
+      req.file ?? null,
+    );
+
+    res.json({
+      ok: true,
+      id: record.id,
+      url: `/survey/${record.id}`,
+      form: publicFormRecord(record),
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: String(error?.message ?? error) });
+  }
+});
+
+function publicFormRecord(record) {
+  return toPublicFormRecord(record);
+}
+
+app.get('/api/forms/:id', async (req, res) => {
+  const record = await getFormRecord(req.params.id);
+  if (!record) {
+    res.status(404).json({ ok: false, error: '폼을 찾을 수 없습니다.' });
+    return;
+  }
+
+  res.json({ ok: true, form: publicFormRecord(record) });
+});
+
+app.post('/api/forms/:id/responses', async (req, res) => {
+  const record = await getFormRecord(req.params.id);
+  if (!record) {
+    res.status(404).json({ ok: false, error: '폼을 찾을 수 없습니다.' });
+    return;
+  }
+
+  const values = req.body?.values ?? {};
+  const response = await saveResponseRecord(req.params.id, values);
+
+  res.json({ ok: true, response });
+});
+
+app.get('/api/forms/:id/responses', async (req, res) => {
+  const record = await getFormRecord(req.params.id);
+  if (!record) {
+    res.status(404).json({ ok: false, error: '폼을 찾을 수 없습니다.' });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    responses: await listResponseRecords(req.params.id),
+  });
+});
+
+app.get('/api/forms/:id/responses/:responseId/fill', async (req, res) => {
+  const record = await getFormRecord(req.params.id);
+  if (!record) {
+    res.status(404).json({ ok: false, error: '폼을 찾을 수 없습니다.' });
+    return;
+  }
+  const sourceFile = await downloadOriginalDocument(record);
+  if (!sourceFile) {
+    res.status(422).json({ ok: false, error: '원본 HWP/HWPX 파일이 저장되지 않은 폼입니다.' });
+    return;
+  }
+
+  const response = await getResponseRecord(req.params.id, req.params.responseId);
+  if (!response) {
+    res.status(404).json({ ok: false, error: '응답을 찾을 수 없습니다.' });
+    return;
+  }
+
+  try {
+    const outputFormat = /\.hwpx$/i.test(sourceFile.originalName) ? 'hwpx' : 'hwp';
+    const result = fillHwpWithResponses(sourceFile.buffer, record.fields, response.values, outputFormat);
+    const baseName = safeFileBaseName(sourceFile.originalName);
+    const extension = outputFormat === 'hwpx' ? 'hwpx' : 'hwp';
+
+    res.setHeader('Content-Type', outputFormat === 'hwpx' ? 'application/hwp+zip' : 'application/x-hwp');
+    res.setHeader('X-Rhwp-Version', result.rhwpVersion);
+    res.setHeader('X-Fill-Summary', encodeURIComponent(JSON.stringify(result.summary)));
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(`${baseName}-${response.id}.${extension}`)}"`);
+    res.send(result.bytes);
+  } catch (error) {
+    res.status(422).json({ ok: false, error: String(error?.message ?? error) });
+  }
 });
 
 app.post('/api/rhwp/extract', upload.single('file'), async (req, res) => {

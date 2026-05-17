@@ -12,6 +12,8 @@ export default defineConfig(({ mode }) => ({
   server: {
     proxy: {
       '/api/rhwp': 'http://localhost:8787',
+      '/api/llm': 'http://localhost:8787',
+      '/api/forms': 'http://localhost:8787',
     },
   },
   preview: {
@@ -19,6 +21,8 @@ export default defineConfig(({ mode }) => ({
     allowedHosts: ['crumblycake.kro.kr', 'likelion14.kro.kr'],
     proxy: {
       '/api/rhwp': 'http://localhost:8787',
+      '/api/llm': 'http://localhost:8787',
+      '/api/forms': 'http://localhost:8787',
     },
   },
 }));

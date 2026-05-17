@@ -10,6 +10,10 @@
 - 공개 신청 화면 미리보기 및 응답 저장
 - 응답 CSV 내보내기, 폼 스키마 JSON 내보내기
 - 원본 HWP/HWPX의 확인된 셀 위치에 입력값을 삽입해 채워진 문서 다운로드
+- 검수된 폼의 공유 링크 생성, 신청자 전용 페이지(`/survey/:id`) 제공
+- 공유 링크로 제출된 응답 조회, CSV 다운로드, 응답별 HWP 생성
+- 섹션별 폼 빌더/미리보기, 원본 페이지 이미지와 입력 위치 하이라이트
+- 동일 파일 재업로드 시 브라우저 분석 캐시 사용
 
 ## 실행
 
@@ -60,6 +64,38 @@ curl \
 
 응답 헤더 `X-Fill-Summary`에는 삽입/건너뜀/실패 개수가 들어갑니다.
 
+검수한 폼을 신청자에게 공유하려면 웹페이지의 `신청자 공유` 영역에서 공유 링크를 생성합니다. 서버 API는 다음 흐름을 제공합니다.
+
+```text
+POST /api/forms
+GET /api/forms/:id
+POST /api/forms/:id/responses
+GET /api/forms/:id/responses
+GET /api/forms/:id/responses/:responseId/fill
+```
+
+기본 저장소는 개발용 인메모리 방식입니다. 서버를 재시작하면 생성된 공유 링크와 응답은 초기화됩니다. 아래 Supabase 설정을 추가하면 DB와 Storage에 영구 저장합니다.
+
+## Supabase 영구 저장
+
+`keys.env`에 Supabase 설정을 추가하면 공유 폼, 응답, 원본 HWP/HWPX 파일을 Supabase에 저장합니다. 설정이 없으면 기존처럼 개발용 인메모리 저장소를 사용합니다.
+
+```bash
+export SUPABASE_URL=https://your-project.supabase.co
+export SUPABASE_SERVICE_ROLE_KEY=...
+export SUPABASE_STORAGE_BUCKET=form-documents
+```
+
+초기 스키마는 [docs/supabase-schema.sql](docs/supabase-schema.sql)을 Supabase SQL Editor에서 실행합니다. Storage에는 private bucket `form-documents`를 생성하세요.
+
+브라우저는 Supabase에 직접 접근하지 않습니다.
+
+```text
+브라우저 → Express 서버 → Supabase DB/Storage
+```
+
+따라서 service role key는 서버의 `keys.env`에만 두고 프론트엔드 환경변수로 넣지 않습니다.
+
 HWP 신청서를 분석해 페이지 이미지, HWPX, 텍스트 JSON, 필드 후보 CSV/JSON을 한 번에 만들 수 있습니다.
 
 ```bash
@@ -86,6 +122,14 @@ model: gpt-5.3-chat-latest
 ```bash
 export SCHOOL_LLM_MODEL=gpt-5.3-chat-latest
 ```
+
+크레딧 잔량은 서버가 `keys.env`의 토큰으로 Mindlogic 게이트웨이를 호출해 확인합니다. 브라우저에는 토큰을 내려보내지 않습니다.
+
+```bash
+curl http://localhost:8787/api/llm/credits
+```
+
+웹페이지 왼쪽 패널의 `LLM 크레딧` 카드에서 잔량을 간단히 확인하고 새로고침할 수 있습니다.
 
 현재 기본 LLM 모드는 `direct-evidence`입니다. 규칙 후보를 정답처럼 넘기지 않고, 원본 HWP에서 뽑은 중립 증거를 LLM에 제공합니다.
 
